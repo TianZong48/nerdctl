@@ -20,8 +20,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"regexp"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/containerd/containerd/errdefs"
@@ -496,4 +499,49 @@ func TestRunDNS(t *testing.T) {
 	cmd.AssertOutContains("nameserver 8.8.8.8\n")
 	cmd.AssertOutContains("search test\n")
 	cmd.AssertOutContains("options attempts:10\n")
+}
+
+func TestSharedNetworkStack(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("--network=container:<container name|id> only supports linux now")
+	}
+	if rootlessutil.IsRootless() {
+		t.Skip(" not supported rootless mode yet")
+	}
+	base := testutil.NewBase(t)
+
+	containerName := testutil.Identifier(t)
+	defer base.Cmd("rm", "-f", containerName).AssertOK()
+	base.Cmd("run", "-d", "--name", containerName,
+		testutil.NginxAlpineImage).AssertOK()
+	base.EnsureContainerStarted(containerName)
+
+	containerNameJoin := testutil.Identifier(t) + "-nework"
+	defer base.Cmd("rm", "-f", containerNameJoin).AssertOK()
+	cmd := base.Cmd("run",
+		"-d",
+		"--name", containerNameJoin,
+		"--network=container:"+containerName,
+		testutil.CommonImage,
+		"sleep", "infinity")
+	cmd.AssertOK()
+
+	cmd = base.Cmd("exec", containerNameJoin, "wget", "-qO-", "http://127.0.0.1:80")
+	cmd.AssertOutContains(testutil.NginxAlpineIndexHTMLSnippet)
+
+	cmd = base.Cmd("exec", containerNameJoin, "nc", "127.0.0.1", "80", "-v")
+	cmd.AssertCombinedOutContains("open")
+
+	f1, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", base.InspectContainer(containerName).State.Pid))
+	assert.NilError(t, err)
+	f2, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", base.InspectContainer(containerNameJoin).State.Pid))
+	assert.NilError(t, err)
+
+	stat1, ok := f1.Sys().(*syscall.Stat_t)
+	assert.Equal(t, ok, true)
+	stat2, ok := f2.Sys().(*syscall.Stat_t)
+	assert.Equal(t, ok, true)
+
+	assert.Equal(t, stat1.Ino, stat2.Ino)
+	assert.Equal(t, stat1.Dev, stat2.Dev)
 }

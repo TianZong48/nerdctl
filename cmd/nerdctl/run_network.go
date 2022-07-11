@@ -23,12 +23,16 @@ import (
 	"io/fs"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
 	"github.com/containerd/nerdctl/pkg/dnsutil"
 	"github.com/containerd/nerdctl/pkg/dnsutil/hostsstore"
+	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
+	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
 	"github.com/containerd/nerdctl/pkg/mountutil"
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/netutil/nettype"
@@ -164,6 +168,57 @@ func generateNetOpts(cmd *cobra.Command, dataStore, stateDir, ns, id string) ([]
 				ports = append(ports, pm...)
 			}
 		}
+	case nettype.Container:
+		if runtime.GOOS != "linux" {
+			return nil, nil, "", nil, fmt.Errorf("currently '--network=container:<container>' can only works on linux")
+		}
+		if rootlessutil.IsRootless() {
+			return nil, nil, "", nil, fmt.Errorf("currently '--network=container:<container>' can't run rootless")
+		}
+		if len(netSlice) > 1 {
+			return nil, nil, "", nil, fmt.Errorf("only one network allowed using '--network=container:<container>'")
+		}
+		network := strings.Split(netSlice[0], ":")
+		if len(network) != 2 {
+			return nil, nil, "", nil, fmt.Errorf("invalid network: %s, should be \"container:<id|name>\"", netSlice[0])
+		}
+		containerName := network[1]
+		client, ctx, cancel, err := newClient(cmd)
+		if err != nil {
+			return nil, nil, "", nil, err
+		}
+		defer cancel()
+		f := &containerInspector{
+			mode: "native",
+		}
+		walker := &containerwalker.ContainerWalker{
+			Client:  client,
+			OnFound: f.Handler,
+		}
+		n, err := walker.Walk(ctx, containerName)
+		if err != nil {
+			return nil, nil, "", nil, err
+		}
+		if n == 0 || len(f.entries) == 0 {
+			return nil, nil, "", nil, fmt.Errorf("no such container: %s", containerName)
+		}
+		if n > 1 {
+			return nil, nil, "", nil, fmt.Errorf("multiple IDs found with provided prefix: %s", containerName)
+		}
+
+		container, ok := f.entries[0].(*native.Container)
+		if !ok {
+			return nil, nil, "", nil, fmt.Errorf("expected *native.Container, got %T", f.entries[0])
+		}
+		if container.Process.Status.Status != containerd.Running {
+			return nil, nil, "", nil, fmt.Errorf("need container %s running", containerName)
+		}
+
+		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+			Type: specs.NetworkNamespace,
+			Path: fmt.Sprintf("/proc/%d/ns/net", container.Process.Pid),
+		}))
+
 	default:
 		return nil, nil, "", nil, fmt.Errorf("unexpected network type %v", netType)
 	}
