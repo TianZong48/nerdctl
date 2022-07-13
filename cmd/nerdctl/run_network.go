@@ -29,10 +29,10 @@ import (
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
+	"github.com/containerd/nerdctl/pkg/containerinspector"
 	"github.com/containerd/nerdctl/pkg/dnsutil"
 	"github.com/containerd/nerdctl/pkg/dnsutil/hostsstore"
 	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
-	"github.com/containerd/nerdctl/pkg/inspecttypes/native"
 	"github.com/containerd/nerdctl/pkg/mountutil"
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/netutil/nettype"
@@ -188,35 +188,36 @@ func generateNetOpts(cmd *cobra.Command, dataStore, stateDir, ns, id string) ([]
 			return nil, nil, "", nil, err
 		}
 		defer cancel()
-		f := &containerInspector{
-			mode: "native",
-		}
+
+		var pid int
 		walker := &containerwalker.ContainerWalker{
-			Client:  client,
-			OnFound: f.Handler,
+			Client: client,
+			OnFound: func(ctx context.Context, found containerwalker.Found) error {
+				if found.MatchCount > 1 {
+					return fmt.Errorf("multiple containers found with prefix: %s", containerName)
+				}
+				n, err := containerinspector.Inspect(ctx, found.Container)
+				if err != nil {
+					return err
+				}
+				if n.Process.Status.Status != containerd.Running {
+					return fmt.Errorf("can't join network of a non running container: %s", found.Container.ID())
+				}
+				pid = n.Process.Pid
+				return nil
+			},
 		}
 		n, err := walker.Walk(ctx, containerName)
 		if err != nil {
 			return nil, nil, "", nil, err
 		}
-		if n == 0 || len(f.entries) == 0 {
+		if n == 0 {
 			return nil, nil, "", nil, fmt.Errorf("no such container: %s", containerName)
-		}
-		if n > 1 {
-			return nil, nil, "", nil, fmt.Errorf("multiple IDs found with provided prefix: %s", containerName)
-		}
-
-		container, ok := f.entries[0].(*native.Container)
-		if !ok {
-			return nil, nil, "", nil, fmt.Errorf("expected *native.Container, got %T", f.entries[0])
-		}
-		if container.Process.Status.Status != containerd.Running {
-			return nil, nil, "", nil, fmt.Errorf("need container %s running", containerName)
 		}
 
 		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
 			Type: specs.NetworkNamespace,
-			Path: fmt.Sprintf("/proc/%d/ns/net", container.Process.Pid),
+			Path: fmt.Sprintf("/proc/%d/ns/net", pid),
 		}))
 
 	default:
