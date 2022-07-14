@@ -23,16 +23,12 @@ import (
 	"io/fs"
 	"path/filepath"
 	"runtime"
-	"strings"
 
-	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/containers"
 	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
-	"github.com/containerd/nerdctl/pkg/containerinspector"
 	"github.com/containerd/nerdctl/pkg/dnsutil"
 	"github.com/containerd/nerdctl/pkg/dnsutil/hostsstore"
-	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
 	"github.com/containerd/nerdctl/pkg/mountutil"
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/netutil/nettype"
@@ -175,50 +171,6 @@ func generateNetOpts(cmd *cobra.Command, dataStore, stateDir, ns, id string) ([]
 		if rootlessutil.IsRootless() {
 			return nil, nil, "", nil, fmt.Errorf("currently '--network=container:<container>' can't run rootless")
 		}
-		if len(netSlice) > 1 {
-			return nil, nil, "", nil, fmt.Errorf("only one network allowed using '--network=container:<container>'")
-		}
-		network := strings.Split(netSlice[0], ":")
-		if len(network) != 2 {
-			return nil, nil, "", nil, fmt.Errorf("invalid network: %s, should be \"container:<id|name>\"", netSlice[0])
-		}
-		containerName := network[1]
-		client, ctx, cancel, err := newClient(cmd)
-		if err != nil {
-			return nil, nil, "", nil, err
-		}
-		defer cancel()
-
-		var pid int
-		walker := &containerwalker.ContainerWalker{
-			Client: client,
-			OnFound: func(ctx context.Context, found containerwalker.Found) error {
-				if found.MatchCount > 1 {
-					return fmt.Errorf("multiple containers found with prefix: %s", containerName)
-				}
-				n, err := containerinspector.Inspect(ctx, found.Container)
-				if err != nil {
-					return err
-				}
-				if n.Process.Status.Status != containerd.Running {
-					return fmt.Errorf("can't join network of a non running container: %s", found.Container.ID())
-				}
-				pid = n.Process.Pid
-				return nil
-			},
-		}
-		n, err := walker.Walk(ctx, containerName)
-		if err != nil {
-			return nil, nil, "", nil, err
-		}
-		if n == 0 {
-			return nil, nil, "", nil, fmt.Errorf("no such container: %s", containerName)
-		}
-
-		opts = append(opts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-			Type: specs.NetworkNamespace,
-			Path: fmt.Sprintf("/proc/%d/ns/net", pid),
-		}))
 
 	default:
 		return nil, nil, "", nil, fmt.Errorf("unexpected network type %v", netType)

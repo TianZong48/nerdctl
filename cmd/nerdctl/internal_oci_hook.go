@@ -56,7 +56,12 @@ func internalOCIHookAction(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	return ocihook.Run(os.Stdin, os.Stderr, event,
+	client, ctx, _, err := newClient(cmd)
+	if err != nil {
+		return err
+	}
+
+	return ocihook.Run(client, ctx, os.Stdin, os.Stderr, event,
 		dataStore,
 		cniPath,
 		cniNetconfpath,

@@ -534,8 +534,10 @@ func TestSharedNetworkStack(t *testing.T) {
 
 	f1, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", base.InspectContainer(containerName).State.Pid))
 	assert.NilError(t, err)
+	t.Log(base.InspectContainer(containerName).State.Pid)
 	f2, err := os.Stat(fmt.Sprintf("/proc/%d/ns/net", base.InspectContainer(containerNameJoin).State.Pid))
 	assert.NilError(t, err)
+	t.Log(base.InspectContainer(containerNameJoin).State.Pid)
 
 	stat1, ok := f1.Sys().(*syscall.Stat_t)
 	assert.Equal(t, ok, true)

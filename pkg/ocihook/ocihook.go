@@ -27,10 +27,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/cmd/ctr/commands"
+	"github.com/containerd/containerd/namespaces"
+	"github.com/containerd/containerd/oci"
 	gocni "github.com/containerd/go-cni"
 	"github.com/containerd/nerdctl/pkg/bypass4netnsutil"
+	"github.com/containerd/nerdctl/pkg/containerinspector"
 	"github.com/containerd/nerdctl/pkg/dnsutil/hostsstore"
+	"github.com/containerd/nerdctl/pkg/formatter"
+	"github.com/containerd/nerdctl/pkg/idutil/containerwalker"
 	"github.com/containerd/nerdctl/pkg/labels"
 	"github.com/containerd/nerdctl/pkg/netutil"
 	"github.com/containerd/nerdctl/pkg/netutil/nettype"
@@ -53,7 +59,7 @@ const (
 	NetworkNamespace = labels.Prefix + "network-namespace"
 )
 
-func Run(stdin io.Reader, stderr io.Writer, event, dataStore, cniPath, cniNetconfPath string) error {
+func Run(client *containerd.Client, ctx context.Context, stdin io.Reader, stderr io.Writer, event, dataStore, cniPath, cniNetconfPath string) error {
 	if stdin == nil || event == "" || dataStore == "" || cniPath == "" || cniNetconfPath == "" {
 		return errors.New("got insufficient args")
 	}
@@ -78,7 +84,9 @@ func Run(stdin io.Reader, stderr io.Writer, event, dataStore, cniPath, cniNetcon
 		logrus.SetOutput(io.MultiWriter(stderr, logFile))
 	}
 
-	opts, err := newHandlerOpts(&state, dataStore, cniPath, cniNetconfPath)
+	logrus.Debugf("%+v", state)
+	logrus.Debug(event)
+	opts, err := newHandlerOpts(client, ctx, &state, dataStore, cniPath, cniNetconfPath)
 	if err != nil {
 		return err
 	}
@@ -93,7 +101,7 @@ func Run(stdin io.Reader, stderr io.Writer, event, dataStore, cniPath, cniNetcon
 	}
 }
 
-func newHandlerOpts(state *specs.State, dataStore, cniPath, cniNetconfPath string) (*handlerOpts, error) {
+func newHandlerOpts(client *containerd.Client, ctx context.Context, state *specs.State, dataStore, cniPath, cniNetconfPath string) (*handlerOpts, error) {
 	o := &handlerOpts{
 		state:     state,
 		dataStore: dataStore,
@@ -133,10 +141,83 @@ func newHandlerOpts(state *specs.State, dataStore, cniPath, cniNetconfPath strin
 	if err != nil {
 		return nil, err
 	}
-
 	switch netType {
-	case nettype.Host, nettype.None, nettype.Container:
+	case nettype.Host, nettype.None:
 		// NOP
+	case nettype.Container:
+
+		if len(networks) > 1 {
+			return nil, fmt.Errorf("only one network allowed using '--network=container:<container>'")
+		}
+		network := strings.Split(networks[0], ":")
+		if len(network) != 2 {
+			return nil, fmt.Errorf("invalid network: %s, should be \"container:<id|name>\"", networks[0])
+		}
+		containerName := network[1]
+		// search container
+		var pid int
+		walker := &containerwalker.ContainerWalker{
+			Client: client,
+			OnFound: func(ctx context.Context, found containerwalker.Found) error {
+				if found.MatchCount > 1 {
+					return fmt.Errorf("multiple containers found with prefix: %s", containerName)
+				}
+				n, err := containerinspector.Inspect(ctx, found.Container)
+				if err != nil {
+					logrus.Error(err)
+					return err
+				}
+				if n.Process == nil {
+					return fmt.Errorf("task %s not found", n.ID)
+				}
+				if n.Process.Status.Status != containerd.Running {
+					return fmt.Errorf("can't join network of a non running container: %s", found.Container.ID())
+				}
+				pid = n.Process.Pid
+				return nil
+			},
+		}
+		n, err := walker.Walk(ctx, containerName)
+		if err != nil {
+			logrus.Error(err)
+			return nil, err
+		}
+		if n == 0 {
+			return nil, fmt.Errorf("container not found: %s", containerName)
+		}
+
+		logrus.Debugf("target container:%s ,pid: %d", containerName, pid)
+
+		ctx := context.Background()
+		ctx = namespaces.WithNamespace(ctx, o.state.Annotations[labels.Namespace])
+
+		// load current container
+		c, err := client.LoadContainer(ctx, state.ID)
+		if err != nil {
+			logrus.Error(err)
+			return nil, err
+		}
+
+		spec, err := c.Spec(ctx)
+		if err != nil {
+			logrus.Error(err)
+			return nil, err
+		}
+		logrus.Debugf("spec, namespace %v", spec.Linux.Namespaces)
+		logrus.Debug("updating spec")
+		err = c.Update(ctx, containerd.UpdateContainerOpts(
+			containerd.WithSpec(spec,
+				oci.WithLinuxNamespace(specs.LinuxNamespace{
+					Type: specs.NetworkNamespace,
+					Path: fmt.Sprintf("/proc/%d/ns/net", pid),
+				}))))
+		if err != nil {
+			return nil, fmt.Errorf("failed to update container spec:%w", err)
+		}
+		logrus.Debugf("spec, namespace %v", spec.Linux.Namespaces)
+		cStatus := formatter.ContainerStatus(ctx, c)
+		logrus.Debugf("container status: %s", cStatus)
+
 	case nettype.CNI:
 		e, err := netutil.NewCNIEnv(cniPath, cniNetconfPath)
 		if err != nil {
